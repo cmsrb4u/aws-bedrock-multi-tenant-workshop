@@ -59,6 +59,21 @@ Complete quota lifecycle via `ccwb quota` commands:
 - [Quota Monitoring Guide](https://github.com/aws-solutions-library-samples/guidance-for-claude-code-with-amazon-bedrock/blob/main/QUOTA_MONITORING.md)
 - [GitHub Repository](https://github.com/aws-solutions-library-samples/guidance-for-claude-code-with-amazon-bedrock)
 
+## Quick Start Workflow
+
+Follow these steps in order:
+
+1. ✅ **Install CCWB** → Use Poetry or pip (see Installation Methods)
+2. ✅ **Create Identity Infrastructure** → Set up Cognito User Pool (Step 2)
+3. ✅ **Initialize Profile** → Run `ccwb init` (Step 3)
+4. ✅ **Verify Profile** → Check with `ccwb context list` (Step 4)
+5. ✅ **Deploy Quota Infrastructure** → Create DynamoDB tables (Step 5)
+6. ✅ **Test Bedrock Access** → Verify API access (Step 6)
+7. ✅ **Set Quota Policies** → Configure user/group limits
+8. ✅ **Monitor Usage** → Track token consumption
+
+**⚠️ Important**: Do not skip Step 5 (Deploy Quota Infrastructure). Quota commands will fail without DynamoDB tables.
+
 ## Prerequisites
 
 Before starting, ensure you have:
@@ -121,6 +136,8 @@ Claude Code With Bedrock 2.2.0
 
 ### Step 1: View Available Commands
 
+First, verify CCWB is installed correctly:
+
 ```bash
 poetry run ccwb list
 ```
@@ -169,7 +186,49 @@ Available commands:
   quota usage        Show current usage against quota limits
 ```
 
-### Step 2: Initialize Profile
+### Step 2: Create Identity Infrastructure
+
+**Before initializing your CCWB profile**, create the required identity provider resources. This step is required for Cognito; skip if using Okta, Auth0, or Azure AD.
+
+#### Create Cognito User Pool
+
+```bash
+aws cognito-idp create-user-pool \
+  --pool-name "CCWBUserPool" \
+  --auto-verified-attributes email \
+  --username-attributes email \
+  --policies '{
+    "PasswordPolicy": {
+      "MinimumLength": 8,
+      "RequireUppercase": true,
+      "RequireLowercase": true,
+      "RequireNumbers": true,
+      "RequireSymbols": false
+    }
+  }' \
+  --region us-west-2
+```
+
+**Actual Output:**
+```json
+{
+  "UserPool": {
+    "Id": "us-west-2_qsKNoAXWR",
+    "Name": "CCWBUserPool",
+    "Policies": { ... },
+    "Arn": "arn:aws:cognito-idp:us-west-2:899950533801:userpool/us-west-2_qsKNoAXWR"
+  }
+}
+```
+
+**✅ Save the User Pool ID**: `us-west-2_qsKNoAXWR` - you'll need this in Step 3.
+
+**Note for other providers**:
+- **Okta**: Use your Okta domain (e.g., `company.okta.com`)
+- **Auth0**: Use your Auth0 tenant domain
+- **Azure AD**: Use your Azure AD tenant ID
+
+### Step 3: Initialize Profile
 
 Create a new CCWB profile interactively:
 
@@ -206,10 +265,12 @@ The `init` command will guide you through profile creation. Here are the prompts
    AWS Region (us-west-2/us-east-1/etc): us-west-2
    ```
 
-6. **Identity Pool Name**: Cognito Identity Pool name (if using Cognito)
+6. **Identity Pool Name**: Use the User Pool ID from Step 2
    ```
-   Identity Pool Name: WorkshopBedrockIdentityPool
+   Identity Pool Name: us-west-2_qsKNoAXWR
    ```
+
+   **Important**: Despite the prompt saying "Identity Pool Name", enter your **User Pool ID** from Step 2.
 
 7. **Bedrock Model**: Select the Claude model to use
    ```
@@ -238,17 +299,7 @@ The `init` command will guide you through profile creation. Here are the prompts
 ✅ Configuration saved to ~/.ccwb/profiles/workshop-dev.json
 ```
 
-**Note**: If you already have a Cognito User Pool, use its User Pool ID when prompted. Otherwise, you can create one first using:
-
-```bash
-aws cognito-idp create-user-pool \
-  --pool-name "CCWBUserPool" \
-  --auto-verified-attributes email \
-  --username-attributes email \
-  --region us-west-2
-```
-
-### Step 3: Verify Profile
+### Step 4: Verify Profile
 
 ```bash
 poetry run ccwb context list
@@ -306,7 +357,85 @@ Metadata:
   Updated:        2026-02-27T04:14:13.189675
 ```
 
-### Step 4: Test Bedrock Access
+### Step 5: Deploy Quota Infrastructure
+
+**Before using quota management commands**, deploy the required DynamoDB tables and Lambda functions.
+
+#### Automated Deployment (Recommended)
+
+```bash
+# Deploy quota infrastructure stack
+poetry run ccwb deploy --stack quota
+```
+
+**Expected Output:**
+```
+Deploying quota infrastructure...
+✅ Created QuotaPolicies DynamoDB table
+✅ Created UserQuotaMetrics DynamoDB table
+✅ Created Lambda functions for quota enforcement
+✅ Created IAM roles and policies
+✅ Deployment complete
+```
+
+#### Manual Deployment (Alternative)
+
+For testing or custom setups, create DynamoDB tables manually:
+
+```bash
+# Create QuotaPolicies table
+aws dynamodb create-table \
+  --table-name QuotaPolicies \
+  --attribute-definitions \
+    AttributeName=policy_type,AttributeType=S \
+    AttributeName=identifier,AttributeType=S \
+  --key-schema \
+    AttributeName=policy_type,KeyType=HASH \
+    AttributeName=identifier,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-west-2
+
+# Create UserQuotaMetrics table
+aws dynamodb create-table \
+  --table-name UserQuotaMetrics \
+  --attribute-definitions \
+    AttributeName=user_id,AttributeType=S \
+    AttributeName=metric_period,AttributeType=S \
+  --key-schema \
+    AttributeName=user_id,KeyType=HASH \
+    AttributeName=metric_period,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-west-2
+```
+
+**Actual Output:**
+```json
+{
+  "TableDescription": {
+    "TableName": "QuotaPolicies",
+    "TableStatus": "CREATING",
+    "TableArn": "arn:aws:dynamodb:us-west-2:899950533801:table/QuotaPolicies"
+  }
+}
+```
+
+#### Verify Deployment
+
+Confirm both tables were created successfully:
+
+```bash
+aws dynamodb list-tables --region us-west-2 | grep Quota
+```
+
+**Expected Output:**
+```
+QuotaPolicies
+UserQuotaMetrics
+```
+
+**✅ Checkpoint**: Both tables should be listed. If not, review deployment errors above. Do not proceed to quota commands until tables exist.
+
+### Step 6: Test Bedrock Access
 
 #### Option A: Direct Bedrock API Test (Development)
 
@@ -361,11 +490,13 @@ poetry run ccwb test
 
 **Note**: The `ccwb test` command requires a packaged distribution created with `ccwb package`. This is typically used when distributing CCWB to end users. For development and direct testing, use Option A above to verify Bedrock API access.
 
-## Quota Management with CCWB v2.1.0+
+## Quota Management Commands
+
+**Prerequisites**: ✅ Complete Step 5 (Deploy Quota Infrastructure) before running these commands.
 
 ### Understanding Quota Infrastructure
 
-CCWB v2.1.0 introduced a DynamoDB-based quota management system with two tables:
+CCWB uses a DynamoDB-based quota management system with two tables:
 
 1. **QuotaPolicies Table**: Stores quota policies
    - Partition key: `policy_type` (user/group/default)
@@ -377,54 +508,7 @@ CCWB v2.1.0 introduced a DynamoDB-based quota management system with two tables:
    - Sort key: `metric_period` (daily/monthly)
    - Records token consumption and quota status
 
-### Deploying Quota Infrastructure
-
-CCWB provides automated CloudFormation-based deployment:
-
-```bash
-# Deploy quota infrastructure stack
-poetry run ccwb deploy --stack quota
-
-# Or deploy all infrastructure including quota
-poetry run ccwb deploy
-```
-
-The quota stack creates:
-- QuotaPolicies DynamoDB table
-- UserQuotaMetrics DynamoDB table
-- Lambda functions for quota enforcement
-- IAM roles and policies
-- CloudWatch log groups
-
-**Alternative: Manual DynamoDB Table Creation**
-
-For testing or custom setups:
-
-```bash
-# Create QuotaPolicies table
-aws dynamodb create-table \
-  --table-name QuotaPolicies \
-  --attribute-definitions \
-    AttributeName=policy_type,AttributeType=S \
-    AttributeName=identifier,AttributeType=S \
-  --key-schema \
-    AttributeName=policy_type,KeyType=HASH \
-    AttributeName=identifier,KeyType=RANGE \
-  --billing-mode PAY_PER_REQUEST \
-  --region us-west-2
-
-# Create UserQuotaMetrics table
-aws dynamodb create-table \
-  --table-name UserQuotaMetrics \
-  --attribute-definitions \
-    AttributeName=user_id,AttributeType=S \
-    AttributeName=metric_period,AttributeType=S \
-  --key-schema \
-    AttributeName=user_id,KeyType=HASH \
-    AttributeName=metric_period,KeyType=RANGE \
-  --billing-mode PAY_PER_REQUEST \
-  --region us-west-2
-```
+**Note**: These tables are created in Step 5. If you skipped Step 5, go back and deploy the infrastructure before proceeding.
 
 ### Quota Policy Management Commands
 
@@ -981,8 +1065,26 @@ argument("file", description="Output file path (.json or .csv)", optional=True)
 ResourceNotFoundException: Requested resource not found: Table: QuotaPolicies not found
 ```
 
+**Cause:**
+You skipped Step 5 (Deploy Quota Infrastructure) or the deployment failed.
+
 **Solution:**
-Manually create the DynamoDB tables (see "Deploying Quota Infrastructure" section above).
+Go back to Step 5 and deploy the infrastructure:
+```bash
+# Option 1: Automated deployment
+poetry run ccwb deploy --stack quota
+
+# Option 2: Manual table creation (see Step 5 for full commands)
+aws dynamodb create-table --table-name QuotaPolicies ...
+aws dynamodb create-table --table-name UserQuotaMetrics ...
+```
+
+Verify deployment:
+```bash
+aws dynamodb list-tables --region us-west-2 | grep Quota
+```
+
+Both `QuotaPolicies` and `UserQuotaMetrics` must be listed.
 
 ### Issue: Profile Creation Failed
 
