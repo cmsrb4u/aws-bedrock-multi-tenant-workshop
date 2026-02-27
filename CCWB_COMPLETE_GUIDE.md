@@ -1608,15 +1608,6 @@ A Lambda function triggered on user login reads `department` and `job_level` fro
 
 No policy updates needed when someone changes teams or gets promoted.
 
-### Recommended Implementation Roadmap
-
-| Phase | Timeline | Activities |
-|-------|----------|------------|
-| Foundation | Week 1 | Configure IdP integration, enable SCIM, test user/group sync |
-| Quota Automation | Week 2 | Convert quota policies to IaC, set up CI/CD pipeline |
-| Self-Service | Week 3-4 | Build approval workflow, deploy Team Lead portal, enable dashboards |
-| Advanced | Ongoing | Attribute-based assignment, anomaly detection, quota optimization |
-
 ### Automation Best Practices
 
 1. **Single Source of Truth**: Use IdP as the authoritative source for users and groups
