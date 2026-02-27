@@ -281,16 +281,6 @@ aws bedrock-runtime invoke-model \
 ✓ Bedrock API call succeeded
 ```
 
-View the response with token usage:
-```bash
-cat /tmp/bedrock-test-response.json | jq '{
-  input_tokens: .usage.input_tokens,
-  output_tokens: .usage.output_tokens,
-  stop_reason: .stop_reason,
-  response: .content[0].text
-}'
-```
-
 **Actual Output:**
 ```json
 {
