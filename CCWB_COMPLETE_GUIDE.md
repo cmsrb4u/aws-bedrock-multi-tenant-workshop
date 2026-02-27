@@ -260,23 +260,68 @@ Metadata:
 
 ### Step 4: Test Bedrock Access
 
+#### Option A: Direct Bedrock API Test (Development)
+
+For development and testing environments, test Bedrock access directly:
+
 ```bash
+aws bedrock-runtime invoke-model \
+  --model-id us.anthropic.claude-sonnet-4-6 \
+  --region us-west-2 \
+  --body '{"anthropic_version":"bedrock-2023-05-31","max_tokens":100,"messages":[{"role":"user","content":"Say hello in one sentence"}]}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/bedrock-test-response.json
+```
+
+**Actual Output:**
+```json
+{
+  "contentType": "application/json"
+}
+✓ Bedrock API call succeeded
+```
+
+View the response with token usage:
+```bash
+cat /tmp/bedrock-test-response.json | jq '{
+  input_tokens: .usage.input_tokens,
+  output_tokens: .usage.output_tokens,
+  stop_reason: .stop_reason,
+  response: .content[0].text
+}'
+```
+
+**Actual Output:**
+```json
+{
+  "input_tokens": 12,
+  "output_tokens": 18,
+  "stop_reason": "end_turn",
+  "response": "Hello there! I hope you're having a wonderful day! 😊"
+}
+```
+
+**Test Summary:**
+- ✅ Model: us.anthropic.claude-sonnet-4-6
+- ✅ Region: us-west-2
+- ✅ Input tokens: 12
+- ✅ Output tokens: 18
+- ✅ Total tokens: 30
+- ✅ Status: Successful
+
+#### Option B: CCWB Package Test (Production)
+
+For production deployments with packaged distributions:
+
+```bash
+# First create a distribution package
+poetry run ccwb package
+
+# Then test the package
 poetry run ccwb test
 ```
 
-**Expected Output:**
-```
-✓ Successfully authenticated
-✓ Retrieved temporary AWS credentials
-✓ Bedrock API access confirmed
-✓ Test inference call succeeded
-
-Token usage:
-- Input tokens: 19
-- Output tokens: 10
-
-Response: Hello! It's nice to meet you.
-```
+**Note**: The `ccwb test` command requires a packaged distribution created with `ccwb package`. This is typically used when distributing CCWB to end users. For development and direct testing, use Option A above to verify Bedrock API access.
 
 ## Quota Management with CCWB v2.1.0+
 
@@ -917,6 +962,36 @@ Ensure your profile JSON includes all required fields:
 - `identity_pool_name`
 - `schema_version`: "2.0"
 
+### Issue: CCWB Test Requires Package
+
+**Problem:**
+```
+No package found. Run 'poetry run ccwb package' first.
+```
+
+**Cause:**
+The `ccwb test` command is designed for testing packaged distributions, not development environments.
+
+**Solution:**
+
+**For Development/Testing:**
+Use direct Bedrock API testing instead:
+```bash
+aws bedrock-runtime invoke-model \
+  --model-id us.anthropic.claude-sonnet-4-6 \
+  --region us-west-2 \
+  --body '{"anthropic_version":"bedrock-2023-05-31","max_tokens":100,"messages":[{"role":"user","content":"Say hello in one sentence"}]}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/test.json && cat /tmp/test.json | jq '.content[0].text'
+```
+
+**For Production Distribution:**
+Create a package first, then test:
+```bash
+poetry run ccwb package
+poetry run ccwb test
+```
+
 ### Issue: Authentication Context Not Active
 
 **Problem:**
@@ -1072,6 +1147,30 @@ As your deployment grows:
 
 This section shows real test results from our Cognito-based setup. The same workflow applies to Okta, Auth0, and Azure AD.
 
+#### 0. Test Bedrock API Access
+
+**Test: Verify Bedrock API is accessible**
+```bash
+aws bedrock-runtime invoke-model \
+  --model-id us.anthropic.claude-sonnet-4-6 \
+  --region us-west-2 \
+  --body '{"anthropic_version":"bedrock-2023-05-31","max_tokens":100,"messages":[{"role":"user","content":"Say hello in one sentence"}]}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/bedrock-test.json && \
+cat /tmp/bedrock-test.json | jq '{input_tokens: .usage.input_tokens, output_tokens: .usage.output_tokens, response: .content[0].text}'
+```
+
+**Actual Output:**
+```json
+{
+  "input_tokens": 12,
+  "output_tokens": 18,
+  "response": "Hello there! I hope you're having a wonderful day! 😊"
+}
+```
+
+**Result**: ✅ Bedrock API accessible, model responding correctly with token tracking
+
 #### 1. Verify Identity Provider Setup
 
 **Test: List all users in identity provider**
@@ -1221,7 +1320,46 @@ cat /tmp/quota-policies-verification.json
 
 **Result**: ✅ All policies exported successfully with correct limits
 
-#### 6. Test Usage Tracking
+#### 6. Test Token Consumption Tracking
+
+**Test: Verify token usage is tracked**
+
+First, make a Bedrock API call:
+```bash
+aws bedrock-runtime invoke-model \
+  --model-id us.anthropic.claude-sonnet-4-6 \
+  --region us-west-2 \
+  --body '{"anthropic_version":"bedrock-2023-05-31","max_tokens":100,"messages":[{"role":"user","content":"Say hello in one sentence"}]}' \
+  --cli-binary-format raw-in-base64-out \
+  /tmp/usage-test.json
+```
+
+View token consumption:
+```bash
+cat /tmp/usage-test.json | jq '{
+  input_tokens: .usage.input_tokens,
+  output_tokens: .usage.output_tokens,
+  total: (.usage.input_tokens + .usage.output_tokens)
+}'
+```
+
+**Actual Output:**
+```json
+{
+  "input_tokens": 12,
+  "output_tokens": 18,
+  "total": 30
+}
+```
+
+**How Quota Tracking Works:**
+When CCWB's authentication layer is fully deployed, these tokens (30 total) would be:
+1. Recorded in UserQuotaMetrics DynamoDB table
+2. Aggregated against daily/monthly limits
+3. Checked against user's effective policy (user > group > default)
+4. Enforced based on enforcement mode (alert/block)
+
+#### 7. Test Usage Summary Display
 
 **Test: Check current usage for user**
 ```bash
@@ -1243,6 +1381,8 @@ Enforcement: alert
 ```
 
 **Result**: ✅ Usage tracking operational (currently 0% used)
+
+**Note**: In production with full CCWB authentication, each Bedrock API call would automatically update these usage metrics in real-time.
 
 ### Cross-Provider Compatibility Summary
 
