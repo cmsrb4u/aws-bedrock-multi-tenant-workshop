@@ -171,33 +171,81 @@ Available commands:
 
 ### Step 2: Initialize Profile
 
-You have two options for profile setup:
+Create a new CCWB profile interactively:
 
-**Option A: Create New Profile**
 ```bash
 poetry run ccwb init
 ```
 
-**Option B: Import Existing Configuration**
-```bash
-poetry run ccwb config import /path/to/workshop-dev.json
+**Interactive Prompts:**
+
+The `init` command will guide you through profile creation. Here are the prompts and recommended values:
+
+1. **Profile Name**: Enter a descriptive name (e.g., `workshop-dev`, `production-bedrock`)
+   ```
+   Profile name: workshop-dev
+   ```
+
+2. **Identity Provider Type**: Select your authentication provider
+   ```
+   Provider type (cognito/okta/auth0/azure): cognito
+   ```
+
+3. **Provider Domain**: Your identity provider domain
+   ```
+   Provider domain: workshop.local
+   ```
+
+4. **Client ID**: OAuth/OIDC client identifier
+   ```
+   Client ID: workshop-bedrock-client
+   ```
+
+5. **AWS Region**: Primary AWS region for Bedrock access
+   ```
+   AWS Region (us-west-2/us-east-1/etc): us-west-2
+   ```
+
+6. **Identity Pool Name**: Cognito Identity Pool name (if using Cognito)
+   ```
+   Identity Pool Name: WorkshopBedrockIdentityPool
+   ```
+
+7. **Bedrock Model**: Select the Claude model to use
+   ```
+   Model ID: us.anthropic.claude-sonnet-4-6
+   ```
+
+8. **Quota Monitoring**: Enable quota tracking
+   ```
+   Enable quota monitoring? (y/n): y
+   ```
+
+9. **Monthly Token Limit**: Default organization-wide limit
+   ```
+   Monthly token limit (e.g., 225M): 225000000
+   ```
+
+10. **Daily Token Limit**: Optional daily limit (press Enter to skip)
+    ```
+    Daily token limit (optional): 8000000
+    ```
+
+**Expected Output:**
+```
+✅ Profile 'workshop-dev' created successfully
+✅ Set as active profile
+✅ Configuration saved to ~/.ccwb/profiles/workshop-dev.json
 ```
 
-Example profile configuration (`workshop-dev.json`):
-```json
-{
-  "name": "workshop-dev",
-  "provider_domain": "workshop.local",
-  "client_id": "workshop-bedrock-client",
-  "credential_storage": "session",
-  "aws_region": "us-west-2",
-  "identity_pool_name": "WorkshopBedrockIdentityPool",
-  "schema_version": "2.0",
-  "quota_monitoring_enabled": true,
-  "monthly_token_limit": 225000000,
-  "daily_token_limit": null,
-  "enable_finegrained_quotas": false
-}
+**Note**: If you already have a Cognito User Pool, use its User Pool ID when prompted. Otherwise, you can create one first using:
+
+```bash
+aws cognito-idp create-user-pool \
+  --pool-name "CCWBUserPool" \
+  --auto-verified-attributes email \
+  --username-attributes email \
+  --region us-west-2
 ```
 
 ### Step 3: Verify Profile
@@ -762,12 +810,9 @@ Update your CCWB profile to enable quota monitoring features:
 - `quota_fail_mode`: Behavior on quota check failure ("open" allows, "closed" denies)
 - `quota_check_interval`: Seconds between quota enforcement checks
 
-### Profile Import and Activation
+### Profile Management
 
 ```bash
-# Import profile configuration
-poetry run ccwb config import /path/to/profile.json
-
 # List available profiles
 poetry run ccwb context list
 
@@ -776,6 +821,9 @@ poetry run ccwb context switch production-profile
 
 # View active profile details
 poetry run ccwb context show
+
+# Create additional profiles
+poetry run ccwb init
 ```
 
 ## Quota Monitoring Integration
@@ -936,21 +984,28 @@ ResourceNotFoundException: Requested resource not found: Table: QuotaPolicies no
 **Solution:**
 Manually create the DynamoDB tables (see "Deploying Quota Infrastructure" section above).
 
-### Issue: Profile Import Validation Failed
+### Issue: Profile Creation Failed
 
 **Problem:**
 ```
-Profile validation failed: missing required fields
+Error: Invalid configuration value
 ```
 
 **Solution:**
-Ensure your profile JSON includes all required fields:
-- `name`
-- `provider_domain`
-- `client_id`
-- `aws_region`
-- `identity_pool_name`
-- `schema_version`: "2.0"
+Verify your inputs during profile creation:
+- **Profile name**: Alphanumeric with hyphens/underscores only
+- **AWS Region**: Valid AWS region code (e.g., us-west-2, us-east-1)
+- **Token limits**: Must be positive integers
+- **Provider domain**: Valid domain format
+
+If initialization fails, you can manually edit the profile configuration:
+```bash
+# Profile stored at:
+~/.ccwb/profiles/your-profile-name.json
+
+# Edit manually if needed
+vim ~/.ccwb/profiles/your-profile-name.json
+```
 
 ### Issue: CCWB Test Requires Package
 
