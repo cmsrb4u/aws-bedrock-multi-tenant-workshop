@@ -49,3 +49,13 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+
+# Claude Code
+.claude/
+.env.claude
+
+# Workshop profile configs (may contain sensitive data)
+workshop-profile-config*.json
+
+# Temporary deployment guides
+DEPLOY_TO_GITHUB.md
