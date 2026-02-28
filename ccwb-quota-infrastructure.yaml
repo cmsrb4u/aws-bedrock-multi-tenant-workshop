@@ -1,0 +1,257 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "CCWB User-Level Quota Infrastructure - DynamoDB Tables and Lambda Functions",
+  "Resources": {
+    "QuotaPoliciesTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": "QuotaPolicies",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "policy_type",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "identifier",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "policy_type",
+            "KeyType": "HASH"
+          },
+          {
+            "AttributeName": "identifier",
+            "KeyType": "RANGE"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Service",
+            "Value": "CCWB"
+          },
+          {
+            "Key": "Component",
+            "Value": "QuotaManagement"
+          }
+        ]
+      }
+    },
+    "UserQuotaMetricsTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": "UserQuotaMetrics",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "user_email",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "metric_period",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "user_email",
+            "KeyType": "HASH"
+          },
+          {
+            "AttributeName": "metric_period",
+            "KeyType": "RANGE"
+          }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "ttl",
+          "Enabled": true
+        },
+        "Tags": [
+          {
+            "Key": "Service",
+            "Value": "CCWB"
+          },
+          {
+            "Key": "Component",
+            "Value": "UserMetrics"
+          }
+        ]
+      }
+    },
+    "QuotaLambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "CCWB-QuotaLambdaRole",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "QuotaAccessPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem",
+                    "dynamodb:Query",
+                    "dynamodb:Scan"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::GetAtt": [
+                        "QuotaPoliciesTable",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "UserQuotaMetricsTable",
+                        "Arn"
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "cloudwatch:PutMetricData"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "cognito-idp:AdminGetUser",
+                    "cognito-idp:ListUsersInGroup"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "QuotaCheckFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": "CCWB-QuotaCheck",
+        "Runtime": "python3.12",
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "QuotaLambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 30,
+        "Environment": {
+          "Variables": {
+            "QUOTA_POLICIES_TABLE": {
+              "Ref": "QuotaPoliciesTable"
+            },
+            "USER_METRICS_TABLE": {
+              "Ref": "UserQuotaMetricsTable"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "\nimport json\nimport boto3\nimport os\nfrom datetime import datetime, timedelta\nfrom decimal import Decimal\n\ndynamodb = boto3.resource('dynamodb')\ncloudwatch = boto3.client('cloudwatch')\n\ndef lambda_handler(event, context):\n    # Extract user from JWT claims\n    user_email = event.get('requestContext', {}).get('authorizer', {}).get('claims', {}).get('email')\n    if not user_email:\n        return {'statusCode': 401, 'body': json.dumps({'error': 'User not authenticated'})}\n\n    # Get user's groups from claims\n    groups = event.get('requestContext', {}).get('authorizer', {}).get('claims', {}).get('cognito:groups', '').split(',')\n\n    # Get effective quota policy (user > group > default)\n    policy = get_effective_policy(user_email, groups)\n\n    # Get current usage\n    usage = get_current_usage(user_email)\n\n    # Check quota\n    monthly_exceeded = usage['monthly'] > policy.get('monthly_token_limit', float('inf'))\n    daily_exceeded = usage['daily'] > policy.get('daily_token_limit', float('inf'))\n\n    # Publish metrics\n    publish_metrics(user_email, usage, policy)\n\n    # Enforce quota\n    if (monthly_exceeded or daily_exceeded) and policy.get('enforcement_mode') == 'block':\n        return {\n            'statusCode': 429,\n            'body': json.dumps({\n                'error': 'Quota exceeded',\n                'monthly_usage': usage['monthly'],\n                'monthly_limit': policy.get('monthly_token_limit'),\n                'daily_usage': usage['daily'],\n                'daily_limit': policy.get('daily_token_limit')\n            })\n        }\n\n    # Allow request but log warning if needed\n    if monthly_exceeded or daily_exceeded:\n        print(f\"WARNING: User {user_email} exceeded quota but enforcement is 'alert'\")\n\n    return {\n        'statusCode': 200,\n        'body': json.dumps({\n            'allowed': True,\n            'usage': usage,\n            'limits': {\n                'monthly': policy.get('monthly_token_limit'),\n                'daily': policy.get('daily_token_limit')\n            }\n        })\n    }\n\ndef get_effective_policy(user_email, groups):\n    policies_table = dynamodb.Table(os.environ['QUOTA_POLICIES_TABLE'])\n\n    # Check user-specific policy\n    response = policies_table.get_item(\n        Key={'policy_type': 'user', 'identifier': user_email}\n    )\n    if 'Item' in response and response['Item'].get('enabled'):\n        return response['Item']\n\n    # Check group policies\n    for group in groups:\n        response = policies_table.get_item(\n            Key={'policy_type': 'group', 'identifier': group}\n        )\n        if 'Item' in response and response['Item'].get('enabled'):\n            return response['Item']\n\n    # Return default policy\n    response = policies_table.get_item(\n        Key={'policy_type': 'default', 'identifier': 'default'}\n    )\n    return response.get('Item', {\n        'monthly_token_limit': 225000000,\n        'daily_token_limit': 8000000,\n        'enforcement_mode': 'alert'\n    })\n\ndef get_current_usage(user_email):\n    metrics_table = dynamodb.Table(os.environ['USER_METRICS_TABLE'])\n\n    now = datetime.now()\n    month_key = now.strftime('%Y-%m')\n    day_key = now.strftime('%Y-%m-%d')\n\n    # Get monthly usage\n    monthly_response = metrics_table.get_item(\n        Key={'user_email': user_email, 'metric_period': f'monthly_{month_key}'}\n    )\n    monthly_usage = int(monthly_response.get('Item', {}).get('tokens_used', 0))\n\n    # Get daily usage\n    daily_response = metrics_table.get_item(\n        Key={'user_email': user_email, 'metric_period': f'daily_{day_key}'}\n    )\n    daily_usage = int(daily_response.get('Item', {}).get('tokens_used', 0))\n\n    return {'monthly': monthly_usage, 'daily': daily_usage}\n\ndef publish_metrics(user_email, usage, policy):\n    # Publish custom CloudWatch metrics\n    cloudwatch.put_metric_data(\n        Namespace='CCWB/UserQuota',\n        MetricData=[\n            {\n                'MetricName': 'MonthlyUsagePercent',\n                'Value': (usage['monthly'] / policy.get('monthly_token_limit', 1)) * 100,\n                'Unit': 'Percent',\n                'Dimensions': [{'Name': 'UserEmail', 'Value': user_email}]\n            },\n            {\n                'MetricName': 'DailyUsagePercent',\n                'Value': (usage['daily'] / policy.get('daily_token_limit', 1)) * 100,\n                'Unit': 'Percent',\n                'Dimensions': [{'Name': 'UserEmail', 'Value': user_email}]\n            }\n        ]\n    )\n"
+        }
+      }
+    },
+    "MetricsRecorderFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": "CCWB-MetricsRecorder",
+        "Runtime": "python3.12",
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "QuotaLambdaRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 30,
+        "Environment": {
+          "Variables": {
+            "USER_METRICS_TABLE": {
+              "Ref": "UserQuotaMetricsTable"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "\nimport json\nimport boto3\nimport os\nfrom datetime import datetime, timedelta\nfrom decimal import Decimal\n\ndynamodb = boto3.resource('dynamodb')\ncloudwatch = boto3.client('cloudwatch')\n\ndef lambda_handler(event, context):\n    # Parse Bedrock response to extract token usage\n    user_email = event.get('user_email')\n    input_tokens = event.get('input_tokens', 0)\n    output_tokens = event.get('output_tokens', 0)\n    total_tokens = input_tokens + output_tokens\n\n    if not user_email:\n        return {'statusCode': 400, 'body': json.dumps({'error': 'User email required'})}\n\n    # Update usage metrics\n    metrics_table = dynamodb.Table(os.environ['USER_METRICS_TABLE'])\n\n    now = datetime.now()\n    month_key = now.strftime('%Y-%m')\n    day_key = now.strftime('%Y-%m-%d')\n\n    # Update monthly usage\n    metrics_table.update_item(\n        Key={'user_email': user_email, 'metric_period': f'monthly_{month_key}'},\n        UpdateExpression='ADD tokens_used :val SET last_updated = :now, ttl = :ttl',\n        ExpressionAttributeValues={\n            ':val': Decimal(total_tokens),\n            ':now': now.isoformat(),\n            ':ttl': int((now + timedelta(days=90)).timestamp())\n        }\n    )\n\n    # Update daily usage\n    metrics_table.update_item(\n        Key={'user_email': user_email, 'metric_period': f'daily_{day_key}'},\n        UpdateExpression='ADD tokens_used :val SET last_updated = :now, ttl = :ttl',\n        ExpressionAttributeValues={\n            ':val': Decimal(total_tokens),\n            ':now': now.isoformat(),\n            ':ttl': int((now + timedelta(days=7)).timestamp())\n        }\n    )\n\n    # Publish CloudWatch metrics\n    cloudwatch.put_metric_data(\n        Namespace='CCWB/UserQuota',\n        MetricData=[\n            {\n                'MetricName': 'UserInputTokens',\n                'Value': input_tokens,\n                'Unit': 'Count',\n                'Dimensions': [{'Name': 'UserEmail', 'Value': user_email}]\n            },\n            {\n                'MetricName': 'UserOutputTokens',\n                'Value': output_tokens,\n                'Unit': 'Count',\n                'Dimensions': [{'Name': 'UserEmail', 'Value': user_email}]\n            }\n        ]\n    )\n\n    return {\n        'statusCode': 200,\n        'body': json.dumps({\n            'recorded': True,\n            'user': user_email,\n            'tokens': total_tokens\n        })\n    }\n"
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "QuotaPoliciesTableArn": {
+      "Description": "ARN of QuotaPolicies DynamoDB table",
+      "Value": {
+        "Fn::GetAtt": [
+          "QuotaPoliciesTable",
+          "Arn"
+        ]
+      },
+      "Export": {
+        "Name": "CCWB-QuotaPoliciesTableArn"
+      }
+    },
+    "UserQuotaMetricsTableArn": {
+      "Description": "ARN of UserQuotaMetrics DynamoDB table",
+      "Value": {
+        "Fn::GetAtt": [
+          "UserQuotaMetricsTable",
+          "Arn"
+        ]
+      },
+      "Export": {
+        "Name": "CCWB-UserQuotaMetricsTableArn"
+      }
+    },
+    "QuotaCheckFunctionArn": {
+      "Description": "ARN of Quota Check Lambda function",
+      "Value": {
+        "Fn::GetAtt": [
+          "QuotaCheckFunction",
+          "Arn"
+        ]
+      },
+      "Export": {
+        "Name": "CCWB-QuotaCheckFunctionArn"
+      }
+    },
+    "MetricsRecorderFunctionArn": {
+      "Description": "ARN of Metrics Recorder Lambda function",
+      "Value": {
+        "Fn::GetAtt": [
+          "MetricsRecorderFunction",
+          "Arn"
+        ]
+      },
+      "Export": {
+        "Name": "CCWB-MetricsRecorderFunctionArn"
+      }
+    }
+  }
+}

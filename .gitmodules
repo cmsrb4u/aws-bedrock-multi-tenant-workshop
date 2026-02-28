@@ -1,0 +1,6 @@
+[submodule "aws-bedrock-aip"]
+	path = aws-bedrock-aip
+	url = https://github.com/cmsrb4u/aws-bedrock-application-inference-profile.git
+[submodule "ccwb-quota-monitoring"]
+	path = ccwb-quota-monitoring
+	url = https://github.com/cmsrb4u/aws-Claude-Code-Quota-Monitoring.git
