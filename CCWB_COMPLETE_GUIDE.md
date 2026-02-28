@@ -1569,6 +1569,56 @@ CCWB's quota monitoring capabilities provide enterprise-grade token usage contro
 
 ---
 
+## Automation Strategies for Scaling CCWB
+
+As your organization grows beyond a handful of users, manual CCWB administration becomes unsustainable. The following strategies eliminate manual overhead and scale to 1000+ users. For the full implementation guide with code examples, see [CCWB_AUTOMATION_GUIDE.md](CCWB_AUTOMATION_GUIDE.md).
+
+### Strategy 1: Identity Provider (IdP) Sync (Recommended)
+
+Leverage your existing corporate IdP (Azure AD, Okta, OneLogin) as the single source of truth. Enable SCIM provisioning between your IdP and AWS Cognito — users and groups sync automatically in real-time. When a Cloud Administrator adds a user to "Engineering" in Okta, they authenticate via CCWB, the `groups` claim in the JWT token is read, and the appropriate quota policy applies automatically. User deactivation propagates immediately — no stale accounts.
+
+### Strategy 2: Bulk Import/Export via CSV
+
+For large-scale policy updates across 100+ users or groups at once. Define policies in a CSV file and import via CLI:
+
+```bash
+poetry run ccwb quota import quotas.csv
+poetry run ccwb quota export backup-$(date +%Y%m%d).csv
+```
+
+Ideal for quarterly review cycles where Team Leads update quotas in Excel/Google Sheets, then re-import.
+
+### Strategy 3: Automated Directory Sync
+
+A Python script that syncs Active Directory/LDAP groups and members to Cognito on a schedule. Deploy as an AWS Lambda triggered by EventBridge (e.g., daily at 2 AM). Bridges the gap for organizations that can't use SCIM directly with legacy directory services.
+
+### Strategy 4: Self-Service Portal
+
+A web portal where Team Leads can request quota changes with justification, routed through an automatic approval workflow. Includes real-time usage dashboards and email notifications. Removes the platform team as a bottleneck — the FinOps Lead approves, and changes deploy automatically.
+
+### Strategy 5: Attribute-Based Automatic Assignment
+
+A Lambda function triggered on user login reads `department` and `job_level` from JWT token attributes and calculates quotas dynamically using business rules:
+
+| Department | Base Quota | Director (2x) | VP (3x) |
+|-----------|-----------|----------------|---------|
+| Engineering | 300M/month | 600M/month | 900M/month |
+| ML Team | 500M/month | 1,000M/month | 1,500M/month |
+| Sales | 100M/month | 200M/month | 300M/month |
+
+No policy updates needed when someone changes teams or gets promoted.
+
+### Automation Best Practices
+
+1. **Single Source of Truth**: Use IdP as the authoritative source for users and groups
+2. **Quotas as Code**: Manage quota policies in Git with version control and pull request reviews
+3. **Separation of Concerns**: Cloud Administrator manages users, FinOps Lead approves quotas
+4. **Audit Everything**: Log all changes to quota policies for compliance
+5. **Test First**: Validate sync scripts in non-production before rolling out
+6. **Gradual Rollout**: Start with one team, expand incrementally
+
+---
+
 **Last Updated**: February 27, 2026
 **CCWB Version**: 2.2.0
 **GitHub Repository**: https://github.com/aws-solutions-library-samples/guidance-for-claude-code-with-amazon-bedrock

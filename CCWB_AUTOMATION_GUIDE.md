@@ -51,7 +51,7 @@ Connect Cognito to Azure AD, Okta, or OneLogin:
 ```
 
 **Automatic Flow:**
-1. HR adds user to "Engineering" in Okta
+1. Cloud Administrator adds user to "Engineering" in Okta
 2. User authenticates via CCWB
 3. CCWB reads `groups` claim from JWT token
 4. Engineering quota policy (400M/month) applies automatically
@@ -156,7 +156,7 @@ poetry run ccwb quota export backup-$(date +%Y%m%d).csv
 # 1. Export current policies
 poetry run ccwb quota export current-policies.csv
 
-# 2. Team managers update in Excel/Google Sheets
+# 2. Team Leads update in Excel/Google Sheets
 
 # 3. Re-import updated policies
 poetry run ccwb quota import updated-policies.csv
@@ -222,10 +222,10 @@ aws events put-rule \
 
 ### 5. Self-Service Portal
 
-Build a web portal for team managers:
+Build a web portal for Team Leads:
 
 **Features:**
-- Team managers request quota increases
+- Team Leads request quota increases
 - Automatic approval workflow
 - Real-time usage dashboards
 - Email notifications
@@ -234,10 +234,10 @@ Build a web portal for team managers:
 ```python
 @app.route('/api/quota/request', methods=['POST'])
 def request_quota_change():
-    """Team manager requests quota increase"""
+    """Team Lead requests quota increase"""
     data = request.json
 
-    # Verify manager has permission for group
+    # Verify Team Lead has permission for group
     if not has_permission(data['requester'], data['group']):
         return {"error": "Unauthorized"}, 403
 
@@ -351,7 +351,7 @@ def calculate_quota(department, job_level):
 
 ### Phase 3: Self-Service (Week 3-4)
 1. ✅ Build approval workflow
-2. ✅ Deploy team manager portal
+2. ✅ Deploy Team Lead portal
 3. ✅ Enable usage dashboards
 
 ### Phase 4: Advanced Automation (Ongoing)
@@ -363,7 +363,7 @@ def calculate_quota(department, job_level):
 
 1. **Single Source of Truth**: Use IdP as the authoritative source for users/groups
 2. **Infrastructure as Code**: Manage quotas in Git with Terraform
-3. **Separation of Concerns**: HR manages users, Finance approves quotas
+3. **Separation of Concerns**: Cloud Administrator manages users, FinOps Lead approves quotas
 4. **Audit Everything**: Log all changes to quota policies
 5. **Test in Dev**: Validate sync scripts in non-production first
 6. **Gradual Rollout**: Start with one team, expand incrementally
@@ -375,7 +375,7 @@ def calculate_quota(department, job_level):
 1. **IdP Sync** - Users/groups sync automatically
 2. **Terraform** - Quota policies as code
 3. **Bulk Import** - Large-scale updates
-4. **Self-Service** - Team managers request changes
+4. **Self-Service** - Team Leads request changes
 5. **Attribute-Based** - Automatic assignment by role
 
 **Result**: Zero manual user management, scalable to 1000+ users.
