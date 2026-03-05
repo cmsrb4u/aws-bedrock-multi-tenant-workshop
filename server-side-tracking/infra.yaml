@@ -1,0 +1,531 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Production-grade server-side Bedrock usage tracking with per-user attribution,
+  quota enforcement, Glue/Athena analytics, and alerting pipeline.
+
+Parameters:
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+  AlertEmail:
+    Type: String
+    Description: Email for quota breach and budget alerts
+  DefaultMonthlyTokenLimit:
+    Type: Number
+    Default: 500000000
+    Description: Default monthly token limit per user (500M)
+  GlueCrawlerSchedule:
+    Type: String
+    Default: "cron(0 2 * * ? *)"
+    Description: Glue crawler schedule (default daily at 2 AM UTC)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# S3 BUCKETS
+# ═══════════════════════════════════════════════════════════════════════════════
+Resources:
+
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'bedrock-tracking-access-logs-${AWS::AccountId}-${AWS::Region}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  InvocationLogBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: AccessLogBucket
+    Properties:
+      BucketName: !Sub 'bedrock-invocation-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref LogEncryptionKey
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: invocation-log-bucket/
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      VersioningConfiguration:
+        Status: Enabled
+
+  InvocationLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InvocationLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockInvocationLogging
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${InvocationLogBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*'
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt InvocationLogBucket.Arn
+              - !Sub '${InvocationLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'bedrock-athena-results-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref LogEncryptionKey
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResults
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # KMS
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  LogEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for Bedrock invocation logs and Athena results
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: BedrockAccess
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: ServiceRolesAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringLike:
+                aws:PrincipalArn:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/BedrockGlueCrawlerRole'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/BedrockEnforcementLambdaRole'
+
+  LogEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/bedrock-tracking-key
+      TargetKeyId: !Ref LogEncryptionKey
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # CLOUDWATCH LOGS
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  InvocationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/bedrock/server-side-tracking
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # IAM — BEDROCK LOGGING
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  BedrockLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockInvocationLoggingRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${InvocationLogGroup.Arn}:*'
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # SNS — ALERTING
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  QuotaBreachTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: bedrock-quota-breach
+      KmsMasterKeyId: alias/aws/sns
+
+  QuotaBreachEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref QuotaBreachTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: bedrock-usage-alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # DYNAMODB — QUOTA POLICIES + USAGE METRICS
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  QuotaPoliciesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BedrockQuotaPolicies
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref LogEncryptionKey
+      AttributeDefinitions:
+        - AttributeName: policyId
+          AttributeType: S
+        - AttributeName: policyType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: policyId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: byType
+          KeySchema:
+            - AttributeName: policyType
+              KeyType: HASH
+            - AttributeName: policyId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  UserQuotaMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BedrockUserQuotaMetrics
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref LogEncryptionKey
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: periodKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: periodKey
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # GLUE — CATALOG + CRAWLER
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: bedrock_tracking
+        Description: Bedrock invocation logs for per-user cost attribution
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockGlueCrawlerRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InvocationLogBucket.Arn
+                  - !Sub '${InvocationLogBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt LogEncryptionKey.Arn
+
+  InvocationLogCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: bedrock-invocation-log-crawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${InvocationLogBucket}/invocation-logs/'
+      Schedule:
+        ScheduleExpression: !Ref GlueCrawlerSchedule
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: >
+        {
+          "Version": 1.0,
+          "Grouping": {"TableGroupingPolicy": "CombineCompatibleSchemas"},
+          "CrawlerOutput": {"Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}}
+        }
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # ATHENA
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: bedrock-tracking
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/query-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !GetAtt LogEncryptionKey.Arn
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB safety limit
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # LAMBDA — QUOTA ENFORCEMENT
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  EnforcementLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockEnforcementLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EnforcementAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt QuotaPoliciesTable.Arn
+                  - !Sub '${QuotaPoliciesTable.Arn}/index/*'
+                  - !GetAtt UserQuotaMetricsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref QuotaBreachTopic
+                  - !Ref AlertTopic
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:GetInferenceProfile
+                  - bedrock:ListTagsForResource
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+
+  EnforcementFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bedrock-quota-enforcement
+      Runtime: python3.9
+      Handler: handler.lambda_handler
+      CodeUri: enforcement/
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt EnforcementLambdaRole.Arn
+      Environment:
+        Variables:
+          QUOTA_POLICIES_TABLE: !Ref QuotaPoliciesTable
+          USER_METRICS_TABLE: !Ref UserQuotaMetricsTable
+          QUOTA_BREACH_TOPIC: !Ref QuotaBreachTopic
+          ALERT_TOPIC: !Ref AlertTopic
+          DEFAULT_MONTHLY_LIMIT: !Ref DefaultMonthlyTokenLimit
+          REGION: !Ref AWS::Region
+
+  EnforcementSnsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EnforcementFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+  AlertTopicLambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt EnforcementFunction.Arn
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # EVENTBRIDGE — SCHEDULED TASKS
+  # ═════════════════════════════════════════════════════════════════════════════
+
+  CrawlerTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockCrawlerTriggerRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartCrawler
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: glue:StartCrawler
+                Resource: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${InvocationLogCrawler}'
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OUTPUTS
+# ═══════════════════════════════════════════════════════════════════════════════
+Outputs:
+  BucketName:
+    Value: !Ref InvocationLogBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+  LogGroupName:
+    Value: !Ref InvocationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+  LoggingRoleArn:
+    Value: !GetAtt BedrockLoggingRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LoggingRoleArn'
+  QuotaPoliciesTableName:
+    Value: !Ref QuotaPoliciesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaPoliciesTable'
+  UserMetricsTableName:
+    Value: !Ref UserQuotaMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UserMetricsTable'
+  QuotaBreachTopicArn:
+    Value: !Ref QuotaBreachTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaBreachTopic'
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic'
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroup'
+  AthenaResultsBucket:
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaResultsBucket'
+  EnforcementFunctionArn:
+    Value: !GetAtt EnforcementFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EnforcementFunction'
+  KmsKeyArn:
+    Value: !GetAtt LogEncryptionKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KmsKeyArn'

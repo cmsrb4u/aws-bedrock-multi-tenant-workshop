@@ -1,0 +1,4 @@
+.aws-sam/
+server_side_tracking_config.json
+server_side_tracking_report.json
+dashboard.json
