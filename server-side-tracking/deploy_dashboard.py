@@ -63,7 +63,7 @@ USER_LIMITS = {u["id"]: DEFAULT_MONTHLY_LIMIT for u in users}
 
 def metric(namespace, name, profile_id, stat="Sum", period=300):
     """Build a CloudWatch metric definition (4 items + options dict)."""
-    return [namespace, name, "InferenceProfileId", profile_id, {"stat": stat}]
+    return [namespace, name, "ModelId", profile_id, {"stat": stat}]
 
 
 def single_value_widget(user, y, x, width=6, height=4):
@@ -73,8 +73,8 @@ def single_value_widget(user, y, x, width=6, height=4):
         "x": x, "y": y, "width": width, "height": height,
         "properties": {
             "metrics": [
-                ["AWS/Bedrock", "InputTokenCount", "InferenceProfileId", user["profile_id"], {"id": "m1", "visible": False}],
-                ["AWS/Bedrock", "OutputTokenCount", "InferenceProfileId", user["profile_id"], {"id": "m2", "visible": False}],
+                ["AWS/Bedrock", "InputTokenCount", "ModelId", user["profile_id"], {"id": "m1", "visible": False, "stat": "Sum"}],
+                ["AWS/Bedrock", "OutputTokenCount", "ModelId", user["profile_id"], {"id": "m2", "visible": False, "stat": "Sum"}],
                 [{"expression": "m1 + m2", "label": "Total Tokens", "id": "total"}],
             ],
             "view": "singleValue",
@@ -95,8 +95,8 @@ def gauge_widget(user, y, x, width=6, height=5):
         "x": x, "y": y, "width": width, "height": height,
         "properties": {
             "metrics": [
-                ["AWS/Bedrock", "InputTokenCount", "InferenceProfileId", user["profile_id"], {"id": "m1", "visible": False}],
-                ["AWS/Bedrock", "OutputTokenCount", "InferenceProfileId", user["profile_id"], {"id": "m2", "visible": False}],
+                ["AWS/Bedrock", "InputTokenCount", "ModelId", user["profile_id"], {"id": "m1", "visible": False, "stat": "Sum"}],
+                ["AWS/Bedrock", "OutputTokenCount", "ModelId", user["profile_id"], {"id": "m2", "visible": False, "stat": "Sum"}],
                 [{
                     "expression": f"((m1 + m2) / {limit}) * 100",
                     "label": "Quota %",
@@ -165,8 +165,8 @@ def bar_chart_widget(users_list, title, y, x=0, width=12, height=6):
     """Bar chart comparing current token usage across users."""
     metrics = []
     for i, user in enumerate(users_list):
-        metrics.append(["AWS/Bedrock", "InputTokenCount", "InferenceProfileId", user["profile_id"]])
-        metrics.append(["AWS/Bedrock", "OutputTokenCount", "InferenceProfileId", user["profile_id"]])
+        metrics.append(["AWS/Bedrock", "InputTokenCount", "ModelId", user["profile_id"]])
+        metrics.append(["AWS/Bedrock", "OutputTokenCount", "ModelId", user["profile_id"]])
 
     return {
         "type": "metric",
@@ -243,8 +243,8 @@ for i, user in enumerate(users):
         "width": 12 // len(users), "height": 6,
         "properties": {
             "metrics": [
-                ["AWS/Bedrock", "InputTokenCount", "InferenceProfileId", user["profile_id"], {"id": "m1", "visible": False}],
-                ["AWS/Bedrock", "OutputTokenCount", "InferenceProfileId", user["profile_id"], {"id": "m2", "visible": False}],
+                ["AWS/Bedrock", "InputTokenCount", "ModelId", user["profile_id"], {"id": "m1", "visible": False, "stat": "Sum"}],
+                ["AWS/Bedrock", "OutputTokenCount", "ModelId", user["profile_id"], {"id": "m2", "visible": False, "stat": "Sum"}],
                 [{"expression": f"((m1 + m2) / {limit}) * 100", "label": f"{user['id']} %", "id": "pct"}],
             ],
             "view": "singleValue",
